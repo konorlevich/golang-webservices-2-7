@@ -13,7 +13,25 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
+
+func (s *Stat) incrementByMethod(method string) {
+	_, ok := s.ByMethod[method]
+	if !ok {
+		s.ByMethod[method] = 1
+	} else {
+		s.ByMethod[method]++
+	}
+}
+func (s *Stat) incrementByConsumer(consumer string) {
+	_, ok := s.ByConsumer[consumer]
+	if !ok {
+		s.ByConsumer[consumer] = 1
+	} else {
+		s.ByConsumer[consumer]++
+	}
+}
 
 type MyBizServer struct {
 }
@@ -29,15 +47,29 @@ func (*MyBizServer) Test(ctx context.Context, req *Nothing) (*Nothing, error) {
 }
 
 type MyAdminServer struct {
-	LogChan chan Event
-	clients []chan Event
-	mu      *sync.RWMutex
+	stat       *Stat
+	LogChan    chan Event
+	logClients []chan Event
+	mu         *sync.RWMutex
+}
+
+func (as *MyAdminServer) pushLogsToClients() {
+	for event := range as.LogChan {
+		as.mu.Lock()
+		as.stat.incrementByConsumer(event.Consumer)
+		as.stat.incrementByMethod(event.Method)
+		logClients := as.logClients
+		as.mu.Unlock()
+		for _, logClient := range logClients {
+			logClient <- event
+		}
+	}
 }
 
 func (as *MyAdminServer) Logging(req *Nothing, srv Admin_LoggingServer) error {
 	clientChan := make(chan Event)
 	as.mu.Lock()
-	as.clients = append(as.clients, clientChan)
+	as.logClients = append(as.logClients, clientChan)
 	as.mu.Unlock()
 	for event := range clientChan {
 		srv.Send(&event)
@@ -45,8 +77,17 @@ func (as *MyAdminServer) Logging(req *Nothing, srv Admin_LoggingServer) error {
 	return nil
 }
 
-func (*MyAdminServer) Statistics(req *StatInterval, srv Admin_StatisticsServer) error {
-	return status.Errorf(codes.Unimplemented, "method Statistics not implemented")
+func (as *MyAdminServer) Statistics(req *StatInterval, srv Admin_StatisticsServer) error {
+	ticker := time.NewTicker(time.Second * time.Duration(req.IntervalSeconds))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			as.mu.Lock()
+			srv.Send(as.stat)
+			as.mu.Unlock()
+		}
+	}
 }
 
 func StartMyMicroservice(ctx context.Context, addr string, data string) error {
@@ -84,25 +125,22 @@ func gRPCService(addr string, aclData string) (func(), error) {
 	)
 	adminSrv := new(MyAdminServer)
 	adminSrv.LogChan = m.Log
+
+	stat := new(Stat)
+	stat.ByConsumer = make(map[string]uint64)
+	stat.ByMethod = make(map[string]uint64)
+
+	adminSrv.stat = stat
 	adminSrv.mu = &sync.RWMutex{}
 	RegisterAdminServer(server, adminSrv)
 	RegisterBizServer(server, new(MyBizServer))
 
-	go func() {
-		for event := range adminSrv.LogChan {
-			adminSrv.mu.Lock()
-			clients := adminSrv.clients
-			adminSrv.mu.Unlock()
-			for _, client := range clients {
-				client <- event
-			}
-		}
-	}()
+	go adminSrv.pushLogsToClients()
 
 	go server.Serve(lis)
 	return func() {
 		close(m.Log)
-		for _, client := range adminSrv.clients {
+		for _, client := range adminSrv.logClients {
 			close(client)
 		}
 		server.GracefulStop()
@@ -110,13 +148,13 @@ func gRPCService(addr string, aclData string) (func(), error) {
 }
 
 func newMiddleware(aclData string) (*Middleware, error) {
-	auth := Middleware{}
-	auth.Log = make(chan Event, 5)
-	err := json.Unmarshal([]byte(aclData), &auth.AclData)
+	m := Middleware{}
+	m.Log = make(chan Event, 5)
+	err := json.Unmarshal([]byte(aclData), &m.AclData)
 	if err != nil {
 		return nil, errors.New("expacted error on bad acl json, have nil")
 	}
-	return &auth, nil
+	return &m, nil
 }
 
 type Middleware struct {
@@ -124,14 +162,14 @@ type Middleware struct {
 	AclData map[string][]string
 }
 
-func (a *Middleware) checkAuth(ctx context.Context, method string) bool {
+func (m *Middleware) checkAuth(ctx context.Context, method string) bool {
 	md, _ := metadata.FromIncomingContext(ctx)
 	consumer := md.Get("consumer")
 	if len(consumer) != 1 {
 		return false
 
 	}
-	rules, ok := a.AclData[consumer[0]]
+	rules, ok := m.AclData[consumer[0]]
 	if !ok {
 		return false
 	}
@@ -147,7 +185,7 @@ func (a *Middleware) checkAuth(ctx context.Context, method string) bool {
 	return false
 }
 
-func (a *Middleware) pushEventToLog(ctx context.Context, methodName string) {
+func (m *Middleware) pushEventToLog(ctx context.Context, methodName string) {
 
 	md, _ := metadata.FromIncomingContext(ctx)
 	consumer := md.Get("consumer")
@@ -156,31 +194,32 @@ func (a *Middleware) pushEventToLog(ctx context.Context, methodName string) {
 	event.Consumer = consumer[0]
 	event.Method = methodName
 	event.Host = p.Addr.String()
-	a.Log <- event
+	m.Log <- event
 }
 
-func (a *Middleware) unaryInterceptor(
+func (m *Middleware) unaryInterceptor(
 	ctx context.Context,
 	req interface{},
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
-	if !a.checkAuth(ctx, info.FullMethod) {
+	if !m.checkAuth(ctx, info.FullMethod) {
 		return nil, status.Error(codes.Unauthenticated, "")
 	}
-	a.pushEventToLog(ctx, info.FullMethod)
+	m.pushEventToLog(ctx, info.FullMethod)
+
 	return handler(ctx, req)
 }
 
-func (a *Middleware) streamInterceptor(
+func (m *Middleware) streamInterceptor(
 	srv interface{},
 	ss grpc.ServerStream,
 	info *grpc.StreamServerInfo,
 	handler grpc.StreamHandler,
 ) error {
-	if !a.checkAuth(ss.Context(), info.FullMethod) {
+	if !m.checkAuth(ss.Context(), info.FullMethod) {
 		return status.Error(codes.Unauthenticated, "")
 	}
-	a.pushEventToLog(ss.Context(), info.FullMethod)
+	m.pushEventToLog(ss.Context(), info.FullMethod)
 	return handler(srv, ss)
 }
