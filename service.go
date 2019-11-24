@@ -69,7 +69,7 @@ func StartMyMicroservice(ctx context.Context, addr string, data string) error {
 }
 
 func gRPCService(addr string, aclData string) (func(), error) {
-	auth, err := newAuth(aclData)
+	m, err := newMiddleware(aclData)
 	if err != nil {
 		return nil, err
 	}
@@ -79,11 +79,11 @@ func gRPCService(addr string, aclData string) (func(), error) {
 	}
 
 	server := grpc.NewServer(
-		grpc.UnaryInterceptor(auth.authInterceptor),
-		grpc.StreamInterceptor(auth.streamInterceptor),
+		grpc.UnaryInterceptor(m.unaryInterceptor),
+		grpc.StreamInterceptor(m.streamInterceptor),
 	)
 	adminSrv := new(MyAdminServer)
-	adminSrv.LogChan = auth.Log
+	adminSrv.LogChan = m.Log
 	adminSrv.mu = &sync.RWMutex{}
 	RegisterAdminServer(server, adminSrv)
 	RegisterBizServer(server, new(MyBizServer))
@@ -101,7 +101,7 @@ func gRPCService(addr string, aclData string) (func(), error) {
 
 	go server.Serve(lis)
 	return func() {
-		close(auth.Log)
+		close(m.Log)
 		for _, client := range adminSrv.clients {
 			close(client)
 		}
@@ -109,8 +109,8 @@ func gRPCService(addr string, aclData string) (func(), error) {
 	}, nil
 }
 
-func newAuth(aclData string) (*Auth, error) {
-	auth := Auth{}
+func newMiddleware(aclData string) (*Middleware, error) {
+	auth := Middleware{}
 	auth.Log = make(chan Event, 5)
 	err := json.Unmarshal([]byte(aclData), &auth.AclData)
 	if err != nil {
@@ -119,12 +119,12 @@ func newAuth(aclData string) (*Auth, error) {
 	return &auth, nil
 }
 
-type Auth struct {
+type Middleware struct {
 	Log     chan Event
 	AclData map[string][]string
 }
 
-func (a *Auth) checkAuth(ctx context.Context, method string) bool {
+func (a *Middleware) checkAuth(ctx context.Context, method string) bool {
 	md, _ := metadata.FromIncomingContext(ctx)
 	consumer := md.Get("consumer")
 	if len(consumer) != 1 {
@@ -147,7 +147,7 @@ func (a *Auth) checkAuth(ctx context.Context, method string) bool {
 	return false
 }
 
-func (a *Auth) pushEventToLog(ctx context.Context, methodName string) {
+func (a *Middleware) pushEventToLog(ctx context.Context, methodName string) {
 
 	md, _ := metadata.FromIncomingContext(ctx)
 	consumer := md.Get("consumer")
@@ -159,7 +159,7 @@ func (a *Auth) pushEventToLog(ctx context.Context, methodName string) {
 	a.Log <- event
 }
 
-func (a *Auth) authInterceptor(
+func (a *Middleware) unaryInterceptor(
 	ctx context.Context,
 	req interface{},
 	info *grpc.UnaryServerInfo,
@@ -172,7 +172,7 @@ func (a *Auth) authInterceptor(
 	return handler(ctx, req)
 }
 
-func (a *Auth) streamInterceptor(
+func (a *Middleware) streamInterceptor(
 	srv interface{},
 	ss grpc.ServerStream,
 	info *grpc.StreamServerInfo,
