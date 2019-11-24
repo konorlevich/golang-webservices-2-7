@@ -17,6 +17,9 @@ import (
 )
 
 func (s *Stat) incrementByMethod(method string) {
+	mu := &sync.Mutex{}
+	mu.Lock()
+	defer mu.Unlock()
 	_, ok := s.ByMethod[method]
 	if !ok {
 		s.ByMethod[method] = 1
@@ -25,6 +28,9 @@ func (s *Stat) incrementByMethod(method string) {
 	}
 }
 func (s *Stat) incrementByConsumer(consumer string) {
+	mu := &sync.Mutex{}
+	mu.Lock()
+	defer mu.Unlock()
 	_, ok := s.ByConsumer[consumer]
 	if !ok {
 		s.ByConsumer[consumer] = 1
@@ -47,21 +53,26 @@ func (*MyBizServer) Test(ctx context.Context, req *Nothing) (*Nothing, error) {
 }
 
 type MyAdminServer struct {
-	stat       *Stat
-	LogChan    chan Event
-	logClients []chan Event
-	mu         *sync.RWMutex
+	stat        *Stat
+	LogChan     chan Event
+	logClients  []chan Event
+	statClients []chan StatMessage
+	mu          *sync.RWMutex
 }
 
-func (as *MyAdminServer) pushLogsToClients() {
+func (as *MyAdminServer) pushLogsAndStatsToClients() {
 	for event := range as.LogChan {
-		as.mu.Lock()
 		as.stat.incrementByConsumer(event.Consumer)
 		as.stat.incrementByMethod(event.Method)
+		as.mu.Lock()
 		logClients := as.logClients
+		statClients := as.statClients
 		as.mu.Unlock()
 		for _, logClient := range logClients {
 			logClient <- event
+		}
+		for _, statClient := range statClients {
+			statClient <- StatMessage{event.Method, event.Consumer}
 		}
 	}
 }
@@ -77,14 +88,29 @@ func (as *MyAdminServer) Logging(req *Nothing, srv Admin_LoggingServer) error {
 	return nil
 }
 
+type StatMessage struct {
+	method   string
+	consumer string
+}
+
 func (as *MyAdminServer) Statistics(req *StatInterval, srv Admin_StatisticsServer) error {
+	statChan := make(chan StatMessage)
+	as.mu.Lock()
+	as.statClients = append(as.statClients, statChan)
+	as.mu.Unlock()
 	ticker := time.NewTicker(time.Second * time.Duration(req.IntervalSeconds))
 	defer ticker.Stop()
+	stat := &Stat{ByMethod: map[string]uint64{}, ByConsumer: map[string]uint64{}}
+	s := StatMessage{}
 	for {
 		select {
+		case s = <-statChan:
+			stat.incrementByMethod(s.method)
+			stat.incrementByConsumer(s.consumer)
 		case <-ticker.C:
 			as.mu.Lock()
-			srv.Send(as.stat)
+			srv.Send(stat)
+			stat = &Stat{ByMethod: map[string]uint64{}, ByConsumer: map[string]uint64{}}
 			as.mu.Unlock()
 		}
 	}
@@ -135,7 +161,7 @@ func gRPCService(addr string, aclData string) (func(), error) {
 	RegisterAdminServer(server, adminSrv)
 	RegisterBizServer(server, new(MyBizServer))
 
-	go adminSrv.pushLogsToClients()
+	go adminSrv.pushLogsAndStatsToClients()
 
 	go server.Serve(lis)
 	return func() {
