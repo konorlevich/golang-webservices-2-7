@@ -53,7 +53,6 @@ func (*MyBizServer) Test(ctx context.Context, req *Nothing) (*Nothing, error) {
 }
 
 type MyAdminServer struct {
-	stat        *Stat
 	LogChan     chan Event
 	logClients  []chan Event
 	statClients []chan StatMessage
@@ -62,19 +61,24 @@ type MyAdminServer struct {
 
 func (as *MyAdminServer) pushLogsAndStatsToClients() {
 	for event := range as.LogChan {
-		as.stat.incrementByConsumer(event.Consumer)
-		as.stat.incrementByMethod(event.Method)
-		as.mu.Lock()
-		logClients := as.logClients
-		statClients := as.statClients
-		as.mu.Unlock()
-		for _, logClient := range logClients {
-			logClient <- event
-		}
-		for _, statClient := range statClients {
-			statClient <- StatMessage{event.Method, event.Consumer}
-		}
+		as.pushLogsToClients(event)
+		as.pushStatsToClients(event.Method, event.Consumer)
 	}
+}
+
+func (as *MyAdminServer) pushStatsToClients(method string, consumer string) {
+	as.mu.Lock()
+	for _, statClient := range as.statClients {
+		statClient <- StatMessage{method, consumer}
+	}
+	as.mu.Unlock()
+}
+func (as *MyAdminServer) pushLogsToClients(event Event) {
+	as.mu.Lock()
+	for _, logClient := range as.logClients {
+		logClient <- event
+	}
+	as.mu.Unlock()
 }
 
 func (as *MyAdminServer) Logging(req *Nothing, srv Admin_LoggingServer) error {
@@ -101,17 +105,20 @@ func (as *MyAdminServer) Statistics(req *StatInterval, srv Admin_StatisticsServe
 	ticker := time.NewTicker(time.Second * time.Duration(req.IntervalSeconds))
 	defer ticker.Stop()
 	stat := &Stat{ByMethod: map[string]uint64{}, ByConsumer: map[string]uint64{}}
-	s := StatMessage{}
+	var s StatMessage
 	for {
 		select {
 		case s = <-statChan:
 			stat.incrementByMethod(s.method)
 			stat.incrementByConsumer(s.consumer)
+			break
 		case <-ticker.C:
 			as.mu.Lock()
+			stat.Timestamp = time.Now().Unix()
 			srv.Send(stat)
 			stat = &Stat{ByMethod: map[string]uint64{}, ByConsumer: map[string]uint64{}}
 			as.mu.Unlock()
+			break
 		}
 	}
 }
@@ -152,18 +159,12 @@ func gRPCService(addr string, aclData string) (func(), error) {
 	adminSrv := new(MyAdminServer)
 	adminSrv.LogChan = m.Log
 
-	stat := new(Stat)
-	stat.ByConsumer = make(map[string]uint64)
-	stat.ByMethod = make(map[string]uint64)
-
-	adminSrv.stat = stat
 	adminSrv.mu = &sync.RWMutex{}
+	go adminSrv.pushLogsAndStatsToClients()
 	RegisterAdminServer(server, adminSrv)
 	RegisterBizServer(server, new(MyBizServer))
-
-	go adminSrv.pushLogsAndStatsToClients()
-
 	go server.Serve(lis)
+
 	return func() {
 		close(m.Log)
 		for _, client := range adminSrv.logClients {
@@ -175,7 +176,7 @@ func gRPCService(addr string, aclData string) (func(), error) {
 
 func newMiddleware(aclData string) (*Middleware, error) {
 	m := Middleware{}
-	m.Log = make(chan Event, 5)
+	m.Log = make(chan Event)
 	err := json.Unmarshal([]byte(aclData), &m.AclData)
 	if err != nil {
 		return nil, errors.New("expacted error on bad acl json, have nil")
@@ -221,6 +222,7 @@ func (m *Middleware) pushEventToLog(ctx context.Context, methodName string) {
 	event.Method = methodName
 	event.Host = p.Addr.String()
 	m.Log <- event
+	time.Sleep(100 * time.Microsecond)
 }
 
 func (m *Middleware) unaryInterceptor(
