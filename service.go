@@ -35,11 +35,11 @@ type MyAdminServer struct {
 }
 
 func (as *MyAdminServer) Logging(req *Nothing, srv Admin_LoggingServer) error {
-	lc := make(chan Event)
+	clientChan := make(chan Event)
 	as.mu.Lock()
-	as.clients = append(as.clients, lc)
+	as.clients = append(as.clients, clientChan)
 	as.mu.Unlock()
-	for event := range lc {
+	for event := range clientChan {
 		srv.Send(&event)
 	}
 	return nil
